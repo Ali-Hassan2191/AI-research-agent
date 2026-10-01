@@ -36,29 +36,44 @@ class GroqLLM(LLM):
 # ---------- 1. TOOL: free DuckDuckGo search ----------
 # NOTE: the tool is NOT called "web_search" on purpose. gpt-oss models have a built-in
 # tool with that name and get confused (they send wrong arguments like "cursor"/"id").
-@tool("search_duckduckgo")
-def search_duckduckgo(search_query: str) -> str:
-    """Search the internet with DuckDuckGo.
-    Argument 'search_query' (required): the text to search for, e.g. 'solar battery market 2026'.
-    Returns titles, links and snippets of the top results."""
-    try:
-        results = DDGS().text(search_query, max_results=6)
-    except Exception as e:
-        return f"Search failed: {e}. Try a different, shorter query."
+def make_search_tool(search_log: list):
+    """Creates the search tool. Every search is also saved into `search_log`
+    so the UI can show it in the 'Search log' tab."""
 
-    if not results:
-        return "No results found. Try a different query."
+    @tool("search_duckduckgo")
+    def search_duckduckgo(search_query: str) -> str:
+        """Search the internet with DuckDuckGo.
+        Argument 'search_query' (required): the text to search for, e.g. 'solar battery market 2026'.
+        Returns titles, links and snippets of the top results."""
+        try:
+            results = DDGS().text(search_query, max_results=6)
+        except Exception as e:
+            search_log.append({"query": search_query, "results": [], "error": str(e)})
+            return f"Search failed: {e}. Try a different, shorter query."
 
-    lines = []
-    for r in results:
-        lines.append(f"Title: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}\n")
-    return "\n".join(lines)
+        if not results:
+            search_log.append({"query": search_query, "results": []})
+            return "No results found. Try a different query."
+
+        search_log.append({
+            "query": search_query,
+            "results": [{"title": r.get("title"), "url": r.get("href")} for r in results],
+        })
+        lines = []
+        for r in results:
+            lines.append(f"Title: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}\n")
+        return "\n".join(lines)
+
+    return search_duckduckgo
 
 
 # ---------- 2. MAIN FUNCTION ----------
-def run_research(topic: str, api_key: str) -> str:
-    """Runs the research agent on `topic` and returns the report as Markdown text."""
+def run_research(topic: str, api_key: str, search_log: list | None = None) -> str:
+    """Runs the research agent on `topic` and returns the report as Markdown text.
+    If you pass an empty list as `search_log`, it will be filled with the searches made."""
     os.environ["GROQ_API_KEY"] = api_key
+    if search_log is None:
+        search_log = []
 
     llm = GroqLLM(
         model=MODEL_NAME,
@@ -74,7 +89,7 @@ def run_research(topic: str, api_key: str) -> str:
             "You are an experienced analyst. You always search the web for up-to-date "
             "information, compare several sources, and never invent facts or links."
         ),
-        tools=[search_duckduckgo],
+        tools=[make_search_tool(search_log)],
         llm=llm,
         allow_delegation=False,  # single-agent app
         max_iter=8,              # max reasoning/search steps (prevents endless loops)
