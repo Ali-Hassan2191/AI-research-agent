@@ -1,17 +1,27 @@
 """
 research_agent.py
 -----------------
-All the CrewAI logic lives here: the search tool, the agent, the task and the crew.
-app.py (the Streamlit UI) just calls run_research().
+All the CrewAI logic lives here. app.py (the Streamlit UI) just calls run_research().
+
+How it works (3 simple steps):
+  1. The LLM decides which web searches to make (it returns a list of search queries).
+  2. We run those searches on DuckDuckGo (free) and collect the results.
+  3. The CrewAI agent reads the results and writes the report, using only real links.
+
+Why not let the model call the search tool itself? gpt-oss on Groq often makes
+malformed tool calls (tool_use_failed errors). Running the search in our own code
+is 100% reliable and also guarantees that the sources in the report are real.
 """
 import os
+import json
+import re
+import time
 
 # Turn off CrewAI telemetry (must be set BEFORE importing crewai)
 os.environ["CREWAI_DISABLE_TELEMETRY"] = "true"
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
 from crewai import Agent, Task, Crew, LLM, Process
-from crewai.tools import tool
 from ddgs import DDGS
 
 MODEL_NAME = "groq/openai/gpt-oss-120b"  # "groq/" = provider, rest = Groq model id
@@ -23,48 +33,51 @@ class GroqLLM(LLM):
     message before it is sent to Groq (Groq returns a 400 error if it is present)."""
 
     def supports_function_calling(self) -> bool:
-        # gpt-oss has its own built-in browser tools (open, find, ...) and tries to call
-        # them, which Groq rejects. Returning False makes CrewAI use plain-text
-        # "Action / Action Input" mode, so no native tool calls are sent to Groq at all.
-        return False
+        return False  # we never use native tool calls with this model
 
     def _format_messages_for_provider(self, messages):
         formatted = super()._format_messages_for_provider(messages)
         return [{k: v for k, v in m.items() if k != "cache_breakpoint"} for m in formatted]
 
 
-# ---------- 1. TOOL: free DuckDuckGo search ----------
-# NOTE: the tool is NOT called "web_search" on purpose. gpt-oss models have a built-in
-# tool with that name and get confused (they send wrong arguments like "cursor"/"id").
-def make_search_tool(search_log: list):
-    """Creates the search tool. Every search is also saved into `search_log`
-    so the UI can show it in the 'Search log' tab."""
-
-    @tool("search_duckduckgo")
-    def search_duckduckgo(search_query: str) -> str:
-        """Search the internet with DuckDuckGo.
-        Argument 'search_query' (required): the text to search for, e.g. 'solar battery market 2026'.
-        Returns titles, links and snippets of the top results."""
+# ---------- 1. WEB SEARCH (DuckDuckGo, free) ----------
+def search_web(query: str, search_log: list) -> list:
+    """Runs one DuckDuckGo search, saves it in search_log and returns the results."""
+    results, error = [], None
+    for attempt in range(2):  # DuckDuckGo sometimes fails once - try twice
         try:
-            results = DDGS().text(search_query, max_results=6)
+            results = DDGS().text(query, max_results=6) or []
+            error = None
+            break
         except Exception as e:
-            search_log.append({"query": search_query, "results": [], "error": str(e)})
-            return f"Search failed: {e}. Try a different, shorter query."
+            error = str(e)
+            time.sleep(1.5)
 
-        if not results:
-            search_log.append({"query": search_query, "results": []})
-            return "No results found. Try a different query."
+    clean = [
+        {"title": r.get("title") or "", "url": r.get("href") or "", "snippet": (r.get("body") or "")[:350]}
+        for r in results if r.get("href")
+    ]
+    entry = {"query": query, "results": [{"title": r["title"], "url": r["url"]} for r in clean]}
+    if error:
+        entry["error"] = error
+    search_log.append(entry)
+    return clean
 
-        search_log.append({
-            "query": search_query,
-            "results": [{"title": r.get("title"), "url": r.get("href")} for r in results],
-        })
-        lines = []
-        for r in results:
-            lines.append(f"Title: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}\n")
-        return "\n".join(lines)
 
-    return search_duckduckgo
+def plan_search_queries(llm: LLM, topic: str) -> list:
+    """Asks the LLM for 4 good search queries. Falls back to simple queries if anything fails."""
+    fallback = [topic, f"{topic} statistics", f"{topic} latest news 2026", f"{topic} analysis"]
+    try:
+        answer = llm.call(
+            "You help with web research. Give 4 different, short web search queries "
+            f"to research this topic thoroughly: {topic}\n"
+            'Reply with ONLY a JSON list of 4 strings, for example ["query one", "query two", "query three", "query four"]'
+        )
+        match = re.search(r"\[.*?\]", str(answer), re.S)
+        queries = [q.strip() for q in json.loads(match.group(0)) if isinstance(q, str) and q.strip()]
+        return queries[:4] or fallback
+    except Exception:
+        return fallback
 
 
 # ---------- 2. MAIN FUNCTION ----------
@@ -81,27 +94,47 @@ def run_research(topic: str, api_key: str, search_log: list | None = None) -> st
         max_tokens=4096,    # keeps us inside Groq's free-tier limits
     )
 
-    # ---- The single agent ----
+    # ---- Step 1 + 2: decide the searches and run them ----
+    sources, seen = [], set()
+    for query in plan_search_queries(llm, topic):
+        for r in search_web(query, search_log):
+            if r["url"] not in seen:
+                seen.add(r["url"])
+                sources.append(r)
+        time.sleep(0.5)  # be gentle with DuckDuckGo
+
+    if not sources:
+        raise RuntimeError(
+            "The web search returned no results (DuckDuckGo may be rate-limiting). "
+            "Please wait a minute and try again."
+        )
+
+    notes = "\n\n".join(
+        f"[{i}] {r['title']}\nURL: {r['url']}\nSnippet: {r['snippet']}"
+        for i, r in enumerate(sources[:20], 1)
+    )
+
+    # ---- Step 3: the single agent writes the report ----
     researcher = Agent(
         role="Senior Research Analyst",
         goal=f"Research the topic '{topic}' thoroughly and write an accurate, well-structured report.",
         backstory=(
-            "You are an experienced analyst. You always search the web for up-to-date "
-            "information, compare several sources, and never invent facts or links."
+            "You are an experienced analyst. You compare several sources, "
+            "and you never invent facts or links."
         ),
-        tools=[make_search_tool(search_log)],
         llm=llm,
         allow_delegation=False,  # single-agent app
-        max_iter=8,              # max reasoning/search steps (prevents endless loops)
+        max_iter=3,
         verbose=False,
     )
 
-    # ---- The task ----
     task = Task(
         description=(
-            f"Research this topic: {topic}\n\n"
-            "Use the search_duckduckgo tool 3-5 times, always passing a 'search_query' text, to gather facts. "
-            "Then write the report using only information you actually found."
+            f"Write a research report on this topic: {topic}\n\n"
+            "Below are web search results that were collected for you. "
+            "Use ONLY information from these results, and only list URLs that appear in them. "
+            "Do not invent facts, numbers or links.\n\n"
+            f"SEARCH RESULTS:\n{notes}"
         ),
         expected_output=(
             "A Markdown report with these sections:\n"
@@ -115,22 +148,5 @@ def run_research(topic: str, api_key: str, search_log: list | None = None) -> st
         agent=researcher,
     )
 
-    # ---- The crew (one agent, one task) ----
-    crew = Crew(
-        agents=[researcher],
-        tasks=[task],
-        process=Process.sequential,
-        verbose=False,
-    )
-
-    # gpt-oss sometimes makes a malformed tool call. Retrying once or twice usually fixes it.
-    last_error = None
-    for attempt in range(3):
-        try:
-            result = crew.kickoff()
-            return result.raw  # the final report text
-        except Exception as e:
-            last_error = e
-            if "tool_use_failed" not in str(e) and "tool call validation" not in str(e).lower():
-                raise  # a different error (e.g. wrong API key) - don't retry
-    raise last_error
+    crew = Crew(agents=[researcher], tasks=[task], process=Process.sequential, verbose=False)
+    return crew.kickoff().raw  # the final report text
