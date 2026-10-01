@@ -22,6 +22,12 @@ class GroqLLM(LLM):
     """Same as CrewAI's LLM, but removes the 'cache_breakpoint' key from every
     message before it is sent to Groq (Groq returns a 400 error if it is present)."""
 
+    def supports_function_calling(self) -> bool:
+        # gpt-oss has its own built-in browser tools (open, find, ...) and tries to call
+        # them, which Groq rejects. Returning False makes CrewAI use plain-text
+        # "Action / Action Input" mode, so no native tool calls are sent to Groq at all.
+        return False
+
     def _format_messages_for_provider(self, messages):
         formatted = super()._format_messages_for_provider(messages)
         return [{k: v for k, v in m.items() if k != "cache_breakpoint"} for m in formatted]
