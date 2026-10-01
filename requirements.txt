@@ -1,0 +1,4 @@
+crewai[litellm]==1.15.23
+crewai-tools==1.15.23
+streamlit==1.64.0
+ddgs==9.16.0
