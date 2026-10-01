@@ -28,12 +28,15 @@ class GroqLLM(LLM):
 
 
 # ---------- 1. TOOL: free DuckDuckGo search ----------
-@tool("Web Search")
-def web_search(query: str) -> str:
-    """Search the web with DuckDuckGo. Input: a short search query.
+# NOTE: the tool is NOT called "web_search" on purpose. gpt-oss models have a built-in
+# tool with that name and get confused (they send wrong arguments like "cursor"/"id").
+@tool("search_duckduckgo")
+def search_duckduckgo(search_query: str) -> str:
+    """Search the internet with DuckDuckGo.
+    Argument 'search_query' (required): the text to search for, e.g. 'solar battery market 2026'.
     Returns titles, links and snippets of the top results."""
     try:
-        results = DDGS().text(query, max_results=6)
+        results = DDGS().text(search_query, max_results=6)
     except Exception as e:
         return f"Search failed: {e}. Try a different, shorter query."
 
@@ -65,7 +68,7 @@ def run_research(topic: str, api_key: str) -> str:
             "You are an experienced analyst. You always search the web for up-to-date "
             "information, compare several sources, and never invent facts or links."
         ),
-        tools=[web_search],
+        tools=[search_duckduckgo],
         llm=llm,
         allow_delegation=False,  # single-agent app
         max_iter=8,              # max reasoning/search steps (prevents endless loops)
@@ -76,7 +79,7 @@ def run_research(topic: str, api_key: str) -> str:
     task = Task(
         description=(
             f"Research this topic: {topic}\n\n"
-            "Use the Web Search tool 3-5 times with different queries to gather facts. "
+            "Use the search_duckduckgo tool 3-5 times, always passing a 'search_query' text, to gather facts. "
             "Then write the report using only information you actually found."
         ),
         expected_output=(
@@ -99,5 +102,14 @@ def run_research(topic: str, api_key: str) -> str:
         verbose=False,
     )
 
-    result = crew.kickoff()
-    return result.raw  # the final report text
+    # gpt-oss sometimes makes a malformed tool call. Retrying once or twice usually fixes it.
+    last_error = None
+    for attempt in range(3):
+        try:
+            result = crew.kickoff()
+            return result.raw  # the final report text
+        except Exception as e:
+            last_error = e
+            if "tool_use_failed" not in str(e) and "tool call validation" not in str(e).lower():
+                raise  # a different error (e.g. wrong API key) - don't retry
+    raise last_error
