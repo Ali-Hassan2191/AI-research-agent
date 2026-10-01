@@ -17,6 +17,16 @@ from ddgs import DDGS
 MODEL_NAME = "groq/openai/gpt-oss-120b"  # "groq/" = provider, rest = Groq model id
 
 
+# ---------- 0. FIX: Groq rejects CrewAI's internal "cache_breakpoint" flag ----------
+class GroqLLM(LLM):
+    """Same as CrewAI's LLM, but removes the 'cache_breakpoint' key from every
+    message before it is sent to Groq (Groq returns a 400 error if it is present)."""
+
+    def _format_messages_for_provider(self, messages):
+        formatted = super()._format_messages_for_provider(messages)
+        return [{k: v for k, v in m.items() if k != "cache_breakpoint"} for m in formatted]
+
+
 # ---------- 1. TOOL: free DuckDuckGo search ----------
 @tool("Web Search")
 def web_search(query: str) -> str:
@@ -41,7 +51,7 @@ def run_research(topic: str, api_key: str) -> str:
     """Runs the research agent on `topic` and returns the report as Markdown text."""
     os.environ["GROQ_API_KEY"] = api_key
 
-    llm = LLM(
+    llm = GroqLLM(
         model=MODEL_NAME,
         temperature=0.3,    # low = more factual, less creative
         max_tokens=4096,    # keeps us inside Groq's free-tier limits
